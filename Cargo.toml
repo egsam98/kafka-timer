@@ -1,0 +1,17 @@
+[package]
+name = "kafka-timer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+crossbeam = "0.8.4"
+futures = "0.3.31"
+itertools = "0.14.0"
+parking_lot = "0.12.3"
+rdkafka = "0.37.0"
+redis-module = { git = "https://github.com/egsam98/redismodule-rs.git" }
+serde = "1.0.219"
+serde_json = "1.0.140"
