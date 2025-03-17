@@ -5,8 +5,8 @@ services:
       - 6379:6379
     command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
     volumes:
-      - ./redis.conf:/usr/local/etc/redis/redis.conf
-      - ../target/release/libkafka_timer.so:/usr/lib/libkafka_timer.so
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ../target/release/libkafka_timer.so:/usr/lib/libkafka_timer.so:ro
 
   kafka:
     image: bitnami/kafka:3.4.0

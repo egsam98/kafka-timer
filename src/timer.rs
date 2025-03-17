@@ -1,27 +1,23 @@
 use std::{collections::HashMap, thread::{self, JoinHandle}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-use crossbeam::{channel::{self, Receiver}, select};
+use crossbeam::{channel::{self, Sender}, select};
 use futures::{future, TryFutureExt};
 use itertools::Itertools;
-use rdkafka::{error::KafkaResult, message::{Header, OwnedHeaders}, producer::{FutureProducer, FutureRecord}, ClientConfig};
+use rdkafka::{message::{Header, OwnedHeaders}, producer::{FutureProducer, FutureRecord}, ClientConfig, Message};
 use redis_module::{key::HashSetFlags, Context, DetachedContext, NextArg, RedisError, RedisResult, RedisString, ZAddFlags, REDIS_OK};
 use serde::Deserialize;
 
 const KEY_MESSAGES: &str = "kafka-timer:messages";
-const KEY_TIMERS: &str = "kafka-timer:pqueue";
+const KEY_PQUEUE: &str = "kafka-timer:pqueue";
 const RANGE_COUNT: usize = 1000;
 
-#[derive(Deserialize, Debug)]
-struct Record {
-    topic: String,
-    key: String,
-    value: String,
-    headers: Option<HashMap<String, serde_json::Value>>,
-}
-
+/// KTIMER.ADD accepts arguments:
+/// - Timeout in seconds to produce record to Kafka
+/// - Kafka record in JSON format
+/// Duplicate record keys are ignored.
 pub fn add(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let mut args = args.into_iter().skip(1);
-    let delay_secs = args.next_u64()?;
+    let timeout_secs = args.next_u64()?;
     let rec_raw = args.next_arg()?;
     let rec = serde_json::from_slice::<Record>(&rec_raw)?;
 
@@ -33,60 +29,93 @@ pub fn add(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
         return REDIS_OK;
     }
 
-    let zset_key = ctx.create_string(KEY_TIMERS);
-    ctx.open_key_writable(&zset_key).zset_add(
-        (unix_now() + delay_secs) as f64, 
+    let pqueue_key = ctx.create_string(KEY_PQUEUE);
+    ctx.open_key_writable(&pqueue_key).zset_add(
+        (unix_now() + timeout_secs) as f64, 
         &hash_key, 
         ZAddFlags::NX,
     )?;
     REDIS_OK
 }
 
-pub fn serve(cx: &Context, cancel: Receiver<()>, kafka_opts: Vec<(String, String)>) -> KafkaResult<JoinHandle<()>> {
-    let producer = ClientConfig::from_iter(kafka_opts).create::<FutureProducer>()?;
+/// Runs background job handling added timers via [add] every second for every [RANGE_COUNT] keys
+pub fn serve(cx: &Context, kafka_props: Vec<(String, String)>) -> RedisResult<Handle> {
+    let producer = ClientConfig::from_iter(kafka_props).create::<FutureProducer>()?;
 
     let detached_cx = DetachedContext::new();
-    detached_cx.set_context(cx).unwrap();
+    detached_cx.set_context(cx)?;
+    let (cancel_tx, cancel_rx) = channel::bounded::<()>(0);
 
     let handle = thread::spawn(move || {
         loop {
             let sleep = channel::after(Duration::from_secs(1));
             select! {
-                recv(cancel) -> _ => return,
+                recv(cancel_rx) -> _ => return,
                 recv(sleep) -> _ => {},
             }
-    
+
             loop {
                 match handle(&detached_cx, &producer) {
-                    Ok(n) if n == 0 => break,
+                    Ok(true) => {},
+                    Ok(false) => break,
                     Err(err) => {
                         detached_cx.log_warning(&err.to_string());
                         break;
                     },
-                    _ => {},
                 }
             }
         }
     });
-    Ok(handle)
+
+    Ok(Handle { inner: handle, cancel_tx })
 }
 
-pub fn handle(cx: &DetachedContext, producer: &FutureProducer) -> RedisResult<usize> {
-    let zset_key = cx.lock().create_string(KEY_TIMERS);
-    let record_keys = match cx
-        .lock()
-        .open_key(&zset_key)
+/// Returned by serve for graceful shutdown as [Self::stop] 
+pub struct Handle {
+    inner: JoinHandle<()>,
+    cancel_tx: Sender<()>,
+}
+
+impl Handle {
+    pub fn stop(self) {
+        _ = self.cancel_tx.send(());
+        self.inner.join().unwrap()
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct Record {
+    topic: String,
+    key: String,
+    value: String,
+    headers: Option<HashMap<String, serde_json::Value>>,
+}
+
+fn handle(cx: &DetachedContext, producer: &FutureProducer) -> RedisResult<bool> {
+    let pqueue_key = cx.lock().create_string(KEY_PQUEUE);
+
+    // Obtain record keys up to [RANGE_COUNT] from sorted set
+    let cx_guard = cx.lock();
+    let (record_keys, has_next) = match cx_guard
+        .open_key(&pqueue_key)
         .zset_score_range(0_f64..=unix_now() as f64, false)
     {
-        Ok(it) => it.take(RANGE_COUNT).collect_vec(),
-        Err(RedisError::WrongType) => return Ok(0),
-        Err(err) => return Err(err) 
+        Ok(mut it) => (
+            it.by_ref().take(RANGE_COUNT).collect_vec(),
+            it.next().is_some(),
+        ),
+        Err(RedisError::WrongType) => return Ok(false),
+        Err(err) => return Err(err),
     };
+    drop(cx_guard);
 
+    // Find corresponding records from hash map
     let msg_key = cx.lock().create_string(KEY_MESSAGES);
-    let Some(records) = cx.lock().open_key(&msg_key).hash_get_multi::<RedisString, RedisString>(&record_keys)? else {
-        return Ok(0);
+    let cx_guard = cx.lock();
+    let Some(records) = cx_guard.open_key(&msg_key).hash_get_multi::<RedisString, RedisString>(&record_keys)? else {
+        return Ok(has_next);
     };
+    drop(cx_guard);
     let records: Vec<(RedisString, Record)> = records
         .into_iter()
         .map(|(key, rec_raw)| -> Result<(RedisString, Record), serde_json::Error> {
@@ -94,10 +123,8 @@ pub fn handle(cx: &DetachedContext, producer: &FutureProducer) -> RedisResult<us
             Ok((key, record))
         })
         .try_collect()?;
-    if records.is_empty() {
-        return Ok(0);
-    }
 
+    // Produce found records into Kafka
     let produce_futures = records
         .iter()
         .map(|(key, rec)| {
@@ -118,25 +145,28 @@ pub fn handle(cx: &DetachedContext, producer: &FutureProducer) -> RedisResult<us
                 .map_ok(move |_| key)
         });
 
+    // Await produce results and remove records from sorted set and hashmap
     let produced_records = futures::executor::block_on(future::join_all(produce_futures))
         .into_iter()
-        .filter_map(|result| match result {
-            Ok(key) => Some(key),
-            Err((err, record)) => {
-                cx.log_warning(&format!("Kafka error: {} (record = {:?})", err, record));
-                None
-            }
+        .filter_map(|result| {
+            result
+                .inspect_err(|(err, msg)| {
+                    cx.log_warning(&format!("Kafka error: {} (topic = {})", err, msg.topic()));
+                })
+                .ok()
         })
         .map(|key| -> RedisResult<()> {
             let cx_guard = cx.lock();
-            cx_guard.open_key_writable(&zset_key).zset_rem(key)?;
+            cx_guard.open_key_writable(&pqueue_key).zset_rem(key)?;
             cx_guard.open_key_writable(&msg_key).hash_del(key)?;
             Ok(())
         })
         .fold_ok(0_usize, |acc, _| acc + 1)?;
 
-    cx.log_notice(&format!("Produced {} records", produced_records));
-    Ok(record_keys.len())
+    if produced_records > 0 {
+        cx.log_notice(&format!("Produced {} records", produced_records));
+    }
+    Ok(has_next)
 }
 
 fn unix_now() -> u64 {
