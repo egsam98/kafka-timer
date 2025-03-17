@@ -5,32 +5,56 @@ use futures::{future, TryFutureExt};
 use itertools::Itertools;
 use rdkafka::{message::{Header, OwnedHeaders}, producer::{FutureProducer, FutureRecord}, ClientConfig, Message};
 use redis_module::{key::HashSetFlags, Context, DetachedContext, NextArg, RedisError, RedisResult, RedisString, ZAddFlags, REDIS_OK};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const KEY_MESSAGES: &str = "kafka-timer:messages";
 const KEY_PQUEUE: &str = "kafka-timer:pqueue";
 const RANGE_COUNT: usize = 1000;
 
 /// KTIMER.ADD accepts arguments:
-/// - Timeout in seconds to produce record to Kafka
-/// - Kafka record in JSON format
+/// - timeout in seconds to produce record to Kafka
+/// - Topic
+/// - key
+/// - value
+/// - optional varargs of key/value pairs for headers
 /// Duplicate record keys are ignored.
-pub fn add(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
+pub fn add(cx: &Context, args: Vec<RedisString>) -> RedisResult {
     let mut args = args.into_iter().skip(1);
-    let timeout_secs = args.next_u64()?;
-    let rec_raw = args.next_arg()?;
-    let rec = serde_json::from_slice::<Record>(&rec_raw)?;
+    let (timeout_secs, topic, key, value, headers) = (
+        args.next_u64()?,
+        args.next_string()?,
+        args.next_string()?,
+        args.next_string()?,
+        args.tuples::<(RedisString, RedisString)>().collect_vec(),
+    );
 
-    let msg_key = ctx.create_string(KEY_MESSAGES);
-    let hash_key = ctx.create_string(rec.key);
-    let n = ctx.open_key_writable(&msg_key)
+    let rec = Record {
+        topic,
+        key,
+        value,
+        headers: match headers.len() {
+            0 => None,
+            _ => {
+                let headers =  headers
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect();
+                Some(headers)
+            }
+        }
+    };
+    let rec_raw = serde_json::to_string(&rec).map(|s| cx.create_string(s))?;
+
+    let msg_key = cx.create_string(KEY_MESSAGES);
+    let hash_key = cx.create_string(rec.key);
+    let n = cx.open_key_writable(&msg_key)
         .hash_set(&hash_key, &rec_raw, HashSetFlags::NX | HashSetFlags::COUNT_ALL)?;
     if n == 0 {
         return REDIS_OK;
     }
 
-    let pqueue_key = ctx.create_string(KEY_PQUEUE);
-    ctx.open_key_writable(&pqueue_key).zset_add(
+    let pqueue_key = cx.create_string(KEY_PQUEUE);
+    cx.open_key_writable(&pqueue_key).zset_add(
         (unix_now() + timeout_secs) as f64, 
         &hash_key, 
         ZAddFlags::NX,
@@ -83,12 +107,12 @@ impl Handle {
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Record {
     topic: String,
     key: String,
     value: String,
-    headers: Option<HashMap<String, serde_json::Value>>,
+    headers: Option<HashMap<String, String>>,
 }
 
 fn handle(cx: &DetachedContext, producer: &FutureProducer) -> RedisResult<bool> {
